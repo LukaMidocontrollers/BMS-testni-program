@@ -6,8 +6,8 @@ JKBMSInterface bms(&Serial2);
 void setup() {
     Serial.begin(115200);
     
-    // Initialize BMS communication (RX=16, TX=17 for ESP32 Serial2 Port)
-    Serial2.begin(115200, SERIAL_8N1, 16, 17);
+    // Initialize BMS communication (RX=20, TX=21 for ESP32P4 Serial2 Port)
+    Serial2.begin(115200, SERIAL_8N1, 20, 21);
     bms.begin(115200);
     
     Serial.println("JK-BMS Basic Reading Example");
