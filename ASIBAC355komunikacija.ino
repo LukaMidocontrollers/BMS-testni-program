@@ -1,112 +1,163 @@
 #include <Arduino.h>
+#include <JKBMSInterface.h>
 
-HardwareSerial bacSerial(2);
+HardwareSerial bacSerial(1);
 
-// UART
-static const uint32_t BAC_BAUD = 115200; // po potrebi spremeni
-static const int BAC_RX_PIN = 16;        // ESP32 RX2 <- BAC TX
-static const int BAC_TX_PIN = 17;        // ESP32 TX2 -> BAC RX
+// Create BMS instance using Serial2
+JKBMSInterface bms(&Serial2);
 
-// Modbus
-static const uint8_t SLAVE_ID = 0x01;     // po potrebi spremeni
-static const uint16_t VBAT_ADDR = 265;    // samo ta register (napetost), za temperaturo pa damo 261 
-static const uint16_t REG_COUNT = 1;
-static const float SCALE = 32.0f;         // podan scale za napetost, 
+// UART CONFIG
+static const uint32_t BAC_BAUD = 115200;   
+static const int BAC_RX_PIN = 47;
+static const int BAC_TX_PIN = 48;
+
+// MODBUS CONFIG
+static const uint8_t SLAVE_ID = 0x01;
+static const uint16_t VBAT_ADDR = 260;
+static const float SCALE = 256.0f;
 
 static const uint32_t POLL_MS = 1000;
 uint32_t lastPoll = 0;
 
-// CRC16 Modbus
+// ---------------- CRC ----------------
 uint16_t modbusCRC(const uint8_t* data, size_t len) {
   uint16_t crc = 0xFFFF;
   for (size_t i = 0; i < len; i++) {
     crc ^= data[i];
     for (int b = 0; b < 8; b++) {
-      if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
+      if (crc & 1) crc = (crc >> 1) ^ 0xA001;
       else crc >>= 1;
     }
   }
   return crc;
 }
 
-void sendRead265() {
+// ---------------- REQUEST ----------------
+void sendReadVBAT() {
   uint8_t req[8];
+
   req[0] = SLAVE_ID;
-  req[1] = 0x03; // Read Holding Registers
-  req[2] = (uint8_t)(VBAT_ADDR >> 8);
-  req[3] = (uint8_t)(VBAT_ADDR & 0xFF);
+  req[1] = 0x03;
+  req[2] = (VBAT_ADDR >> 8) & 0xFF;
+  req[3] = VBAT_ADDR & 0xFF;
   req[4] = 0x00;
-  req[5] = 0x01; // 1 register
+  req[5] = 0x01;
 
   uint16_t crc = modbusCRC(req, 6);
-  req[6] = (uint8_t)(crc & 0xFF);        // CRC low
-  req[7] = (uint8_t)((crc >> 8) & 0xFF); // CRC high
+  req[6] = crc & 0xFF;
+  req[7] = (crc >> 8) & 0xFF;
 
-  bacSerial.write(req, sizeof(req));
-  bacSerial.flush();
+  bacSerial.write(req, 8);
 }
 
-size_t readResponse(uint8_t* buf, size_t maxLen, uint32_t timeoutMs = 120) {
-  size_t n = 0;
-  uint32_t t0 = millis();
-  while (millis() - t0 < timeoutMs) {
-    while (bacSerial.available() && n < maxLen) {
-      buf[n++] = (uint8_t)bacSerial.read();
-      t0 = millis();
+// ---------------- READ RESPONSE ----------------
+size_t readResponse(uint8_t* buf, size_t maxLen, uint32_t timeout = 300) {
+  size_t idx = 0;
+  uint32_t start = millis();
+
+  while (millis() - start < timeout) {
+    while (bacSerial.available() && idx < maxLen) {
+      buf[idx++] = bacSerial.read();
+      start = millis(); // extend timeout while receiving
     }
-    delay(1);
   }
-  return n;
+
+  return idx;
 }
 
-bool parseVbat(const uint8_t* rx, size_t len, float& vbat) {
-  // Pričakovan odgovor: [ID][03][02][DATA_H][DATA_L][CRC_L][CRC_H]
+// ---------------- PARSE ----------------
+bool parseVBAT(const uint8_t* rx, size_t len, float &vbat) {
   if (len < 7) return false;
   if (rx[0] != SLAVE_ID) return false;
-
-  // Exception odgovor
-  if (rx[1] == 0x83) return false;
+  if (rx[1] == 0x83) return false; // exception
   if (rx[1] != 0x03) return false;
-  if (rx[2] != 0x02) return false;
 
   uint16_t crcCalc = modbusCRC(rx, len - 2);
-  uint16_t crcRecv = (uint16_t)rx[len - 2] | ((uint16_t)rx[len - 1] << 8);
+  uint16_t crcRecv = rx[len - 2] | (rx[len - 1] << 8);
   if (crcCalc != crcRecv) return false;
 
-  uint16_t raw = ((uint16_t)rx[3] << 8) | rx[4];
+  uint16_t raw = (rx[3] << 8) | rx[4];
   vbat = raw / SCALE;
+
   return true;
 }
 
+// ---------------- SETUP ----------------
 void setup() {
   Serial.begin(115200);
-  delay(300);
-  bacSerial.begin(BAC_BAUD, SERIAL_8N1, BAC_RX_PIN, BAC_TX_PIN);
+  delay(2000);
 
-  Serial.println("BAC355 VBAT reader: addr 265, scale 32");
+  bacSerial.begin(BAC_BAUD, SERIAL_8N1, BAC_RX_PIN, BAC_TX_PIN);
+  Serial2.begin(115200, SERIAL_8N1, 20, 21); //bms 
+
+  Serial.println("BAC355 Modbus start");
+  Serial.println("JK-BMS Modbus start");
 }
 
+// ---------------- LOOP ----------------
 void loop() {
   if (millis() - lastPoll >= POLL_MS) {
     lastPoll = millis();
 
-    sendRead265();
+    // clear old data
+    while (bacSerial.available()) bacSerial.read();
+
+    delay(5); // Modbus silence gap
+
+    sendReadVBAT();
 
     uint8_t rx[64];
-    size_t n = readResponse(rx, sizeof(rx));
+    size_t n = readResponse(rx, sizeof(rx), 300);
 
     if (n == 0) {
-      Serial.println("Ni odgovora.");
+      Serial.println("No response");
       return;
     }
 
-    float vbat = 0.0f;
-    if (parseVbat(rx, n, vbat)) {
-      Serial.print("VBAT: ");
-      Serial.print(vbat, 2);
-      Serial.println(" V");
-    } else {
-      Serial.println("Napaka pri branju/parsanju.");
+    /*Serial.print("RX bytes: ");
+    for (size_t i = 0; i < n; i++) {
+      Serial.print(rx[i], HEX);
+      Serial.print(" ");
     }
+    Serial.println();*/
+
+    float mtemp;
+    if (parseVBAT(rx, n, mtemp)) {
+      Serial.print("Motor hitrost: ");
+      Serial.print(mtemp, 2);
+      Serial.println(" km/h");
+    } else {
+      Serial.println("Parse error");
+    }
+        
+        
+    bms.update();
+    
+    // Check if we have valid data
+    if (bms.isDataValid()) {
+        // Access battery data
+        float voltage = bms.getVoltage();
+        uint8_t soc = bms.getSOC();
+        float current = bms.getCurrent();
+        
+        Serial.print("Napetost: ");
+        Serial.print(voltage, 2);
+        Serial.print("V, SOC: ");
+        Serial.print(soc);
+        Serial.print("%, Tok: ");
+        Serial.print(current, 2);
+        Serial.println("A");
+
+        static unsigned long lastSummary = 0;
+        if (millis() - lastSummary > 10000) {
+            bms.printSummary();
+            lastSummary = millis();
+        }
+        
+
+    } else {
+        Serial.println("Čakanje na bms podatki...");
+    }
+
   }
 }
