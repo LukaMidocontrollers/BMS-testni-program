@@ -27,15 +27,17 @@ uint16_t modbusCRC(const uint8_t* data, size_t len){ //data je kazalec za posame
 
     for (size_t i = 0; i < len; i++){
         crc ^= data[i]; // Prvo XOR z prvim byte-om  
-        if (crc & data[i]) crc = (crc >> 1) ^ 0xA001; //če LSB pri koncu prejšne operacije 1 ---> Shift right za 1 bit, pa XOR z polinomom
+        for (int b = 0; b < 8; b++){
+        if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001; //če LSB pri koncu prejšne operacije 1 ---> Shift right za 1 bit, pa XOR z polinomom
         else crc >>= 1;   //če je LSB pri koncu prejšne operacije 0 ---> Shift right za 1 bit
+        }
     }
 
     return crc;
 }
 
 //Inicijalizacija UART
-void uart_init(void)
+static void uart_init(void)
 {
     uart_config_t cfg = {
         .baud_rate = 115200,
@@ -50,6 +52,7 @@ void uart_init(void)
     uart_param_config(UART_BAC, &cfg);
     uart_set_pin(UART_BAC, TX_BAC355, RX_BAC355, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
+    uart_flush_input(UART_BAC);
     // -------- BMS UART --------
     uart_driver_install(UART_BMS, 2048, 0, 0, NULL, 0);
     uart_param_config(UART_BMS, &cfg);
@@ -86,19 +89,38 @@ int read_response(uint8_t *buf, int max_len)
 // Razčlenitev
 void parse_response(uint8_t *rx, int len)
 {
-    if (len < 13) {
-        ESP_LOGW(TAG, "No valid response");
+    if (len < (3 + REG_COUNT * 2 + 2)) {
+        ESP_LOGW(TAG, "Frame prekrajši");
         return;
     }
 
-    if (rx[0] != SLAVE_ID || rx[1] != 0x03 || rx[1] == 0x83) {
-        ESP_LOGW(TAG, "Invalid frame");
+    if (rx[0] != SLAVE_ID) {
+        ESP_LOGW(TAG, "Narobe slave ID");
+        return;
+    }
+
+    if (rx[1] == 0x83) {
+        ESP_LOGW(TAG, "Modbus exception");
+        return;
+    }
+
+    if (rx[1] != 0x03) {
+        ESP_LOGW(TAG, "Wrong function code");
+        return;
+    }
+
+    if (rx[2] != REG_COUNT * 2) {
+        ESP_LOGW(TAG, "Byte count mismatch");
         return;
     }
 
     uint16_t crcCalc = modbusCRC(rx, len - 2);        // CRC izračunan
     uint16_t crcRecv = rx[len - 2] | (rx[len - 1] << 8);  // CRC sprejet
-    if (crcCalc != crcRecv) return;
+    if (crcCalc != crcRecv) {
+        ESP_LOGW(TAG, "Narobe CRC");
+        return;
+    }
+  
 
     // raw registri
     uint16_t speed_raw = (rx[3] << 8) | rx[4];     //0x[high byte][lowbyte] , register 260
@@ -119,10 +141,7 @@ void bac_task(void *arg)
 {
     uint8_t rx[128];
 
-    for (;;) {
-
-        // clear old junk
-        uart_flush_input(UART_BAC);
+    while (1) {
 
         // small Modbus silence gap
         vTaskDelay(pdMS_TO_TICKS(5));
